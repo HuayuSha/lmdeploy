@@ -302,3 +302,57 @@ def test_glm5_next_tail_checkpoint_policy_requires_closed_pool_boundary(monkeypa
     hf_config.text_config.index_kpool = 3
     with pytest.raises(ValueError, match='index_kpool=4'):
         Glm5NextModelConfigBuilder.build(hf_config, num_spec_tokens=num_spec_tokens)
+
+
+def _glm5_next_layer_types(full_attention_type):
+    return (['linear_attention'] * 3 + [full_attention_type]) * 2
+
+
+def _check_glm5_next_layer_partition(model):
+    from lmdeploy.pytorch.configurations.glm5_next import is_glm5_kda_layer
+    from lmdeploy.pytorch.consts import GLM5_KDA_RECURRENT_STATE, GLM5_KPOOL_TAIL_K_STATE
+
+    text_config = model.llm_config
+    assert text_config.linear_layer_ids == [0, 1, 2, 4, 5, 6]
+    assert text_config.full_attention_layer_ids == [3, 7]
+    assert [is_glm5_kda_layer(text_config, i) for i in range(8)] == [True, True, True, False] * 2
+    assert model.num_layers == 2
+    specs = {spec.name: spec for spec in model.state_cache_specs}
+    assert specs[GLM5_KDA_RECURRENT_STATE].shape[0] == 6
+    assert specs[GLM5_KPOOL_TAIL_K_STATE].shape[0] == 2
+
+
+@pytest.mark.parametrize('full_attention_type', ['deepseek_sparse_attention', 'indexed_attention', 'full_attention'])
+def test_glm5_next_layer_types_accept_full_attention_aliases(monkeypatch, full_attention_type):
+    from lmdeploy.hf_configs.configuration_glm5_next import Glm5NextConfig
+    from lmdeploy.pytorch.configurations.glm5_next import Glm5NextModelConfigBuilder
+
+    monkeypatch.setattr('lmdeploy.pytorch.configurations.deepseek_v2.flash_mla_available', lambda: True)
+    hf_config = Glm5NextConfig(text_config=dict(num_hidden_layers=8,
+                                                layer_types=_glm5_next_layer_types(full_attention_type)))
+    model = Glm5NextModelConfigBuilder.build(hf_config, tp=8)
+    _check_glm5_next_layer_partition(model)
+
+
+def test_glm5_next_layer_types_reject_unknown_type(monkeypatch):
+    from lmdeploy.hf_configs.configuration_glm5_next import Glm5NextConfig
+    from lmdeploy.pytorch.configurations.glm5_next import Glm5NextModelConfigBuilder
+
+    monkeypatch.setattr('lmdeploy.pytorch.configurations.deepseek_v2.flash_mla_available', lambda: True)
+    hf_config = Glm5NextConfig(text_config=dict(num_hidden_layers=8,
+                                                layer_types=_glm5_next_layer_types('sliding_attention')))
+    with pytest.raises(ValueError, match=r"layer_types only supports .* but got \['sliding_attention'\]"):
+        Glm5NextModelConfigBuilder.build(hf_config, tp=8)
+
+
+def test_glm5_next_native_transformers_config_layer_types(monkeypatch):
+    """Transformers >= 5.19 loads the checkpoint's DSA layers as
+    ``indexed_attention``."""
+    configuration_glm5_next = pytest.importorskip('transformers.models.glm5_next.configuration_glm5_next')
+    from lmdeploy.pytorch.configurations.glm5_next import Glm5NextModelConfigBuilder
+
+    monkeypatch.setattr('lmdeploy.pytorch.configurations.deepseek_v2.flash_mla_available', lambda: True)
+    hf_config = configuration_glm5_next.Glm5NextConfig(text_config=dict(
+        num_hidden_layers=8, index_kpool=4, layer_types=_glm5_next_layer_types('deepseek_sparse_attention')))
+    model = Glm5NextModelConfigBuilder.build(hf_config, tp=8)
+    _check_glm5_next_layer_partition(model)
